@@ -26,6 +26,15 @@ on:
         description: 'Also publish the IPA as a GitHub Release'
         required: false
         default: 'true'
+      patch_mode:
+        description: 'How much of the login fix to apply'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - strings
+          - none
 
 permissions:
   contents: write
@@ -39,11 +48,27 @@ jobs:
     runs-on: ${{ inputs.runner || 'macos-26' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: 0.6.3-loginfix
+      # full    = string rewrite + clear the stale adi.pb once
+      # strings = string rewrite only (keeps whatever adi.pb is there)
+      # none    = untouched 0.6.3, used as a control build
+      PATCH_MODE: ${{ inputs.patch_mode || 'full' }}
       # The only em_proxy release that still ships libem_proxy-*.a / em_proxy.h.
       EM_PROXY_BASE: https://github.com/SideStore/em_proxy/releases/download/build
 
     steps:
+      - name: Resolve variant names
+        run: |
+          case "$PATCH_MODE" in
+            full)    suffix="loginfix" ;;
+            strings) suffix="strings-only" ;;
+            none)    suffix="clean" ;;
+            *) echo "ERROR: unknown PATCH_MODE=$PATCH_MODE"; exit 1 ;;
+          esac
+          echo "IPA_NAME=SideStore-0.6.3-$suffix.ipa" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=SideStore-0.6.3-$suffix" >> "$GITHUB_ENV"
+          echo "VARIANT_TAG=0.6.3-$suffix" >> "$GITHUB_ENV"
+          echo "building variant: $suffix (patch mode: $PATCH_MODE)"
+
       - name: Checkout 0.6.3 (with submodules)
         uses: actions/checkout@v4
         with:
@@ -63,6 +88,7 @@ jobs:
           This applies that change to 0.6.3 - the last version whose refresh /
           VPN flow still works on iOS 17.x.
           """
+          import os
           import re
           import sys
           from pathlib import Path
@@ -127,6 +153,15 @@ jobs:
 
 
           def main():
+              mode = os.environ.get("PATCH_MODE", "full").strip().lower()
+              if mode not in ("full", "strings", "none"):
+                  print("ERROR: unknown PATCH_MODE: %r" % mode)
+                  return 1
+
+              if mode == "none":
+                  print("= control build requested: source left untouched")
+                  return 0
+
               if not TARGET.is_file():
                   print("ERROR: %s not found (run me from the repo root)" % TARGET)
                   return 1
@@ -146,7 +181,9 @@ jobs:
                   print("+ inserted sanitizedAppleString() / migrateAnisetteClientIfNeeded()")
 
               # 2. run the migration at the start of main()
-              if "Self.migrateAnisetteClientIfNeeded()" in src:
+              if mode != "full":
+                  print("= PATCH_MODE=%s: skipping the adi.pb migration" % mode)
+              elif "Self.migrateAnisetteClientIfNeeded()" in src:
                   print("= migration call already present")
               else:
                   anchor = "        super.main()\n"
@@ -302,26 +339,26 @@ jobs:
           set -euo pipefail
           make ipa
           test -f SideStore.ipa || { echo "ERROR: make ipa did not produce SideStore.ipa"; exit 1; }
-          cp SideStore.ipa "SideStore-$TAG.ipa"
-          ls -lh "SideStore-$TAG.ipa"
+          cp SideStore.ipa "$IPA_NAME"
+          ls -lh "$IPA_NAME"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SideStore-0.6.3-loginfix
-          path: SideStore-0.6.3-loginfix.ipa
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.IPA_NAME }}
           if-no-files-found: error
 
       - name: Publish Release
         if: ${{ (inputs.publish_release || 'true') == 'true' }}
         continue-on-error: true
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "SideStore-$TAG.ipa" --clobber
+          if gh release view "$VARIANT_TAG" >/dev/null 2>&1; then
+            gh release upload "$VARIANT_TAG" "$IPA_NAME" --clobber
           else
-            gh release create "$TAG" \
+            gh release create "$VARIANT_TAG" \
               --target 0.6.3 \
-              --title "SideStore 0.6.3 + Apple 登录修复" \
-              --notes "0.6.3 代码 + anisette client 从 (com.apple.dt.Xcode/...) 改写为 (com.apple.akd/1.0)，修复登录 503。首次登录会自动清除旧的 adi.pb 并重新 provisioning；若仍失败，到 Settings -> Anisette Servers -> Reset adi.pb 后再登录。" \
-              "SideStore-$TAG.ipa"
+              --title "SideStore 0.6.3 (patch mode: $PATCH_MODE)" \
+              --notes "构建变体 patch_mode=$PATCH_MODE。full = 字符串改写 + 清除旧 adi.pb；strings = 仅字符串改写；none = 未改动的 0.6.3 对照包。" \
+              "$IPA_NAME"
           fi
