@@ -68,10 +68,14 @@ jobs:
             none)     suffix="clean" ;;
             *) echo "ERROR: unknown PATCH_MODE=$PATCH_MODE"; exit 1 ;;
           esac
-          echo "IPA_NAME=SideStore-0.6.3-$suffix.ipa" >> "$GITHUB_ENV"
-          echo "ARTIFACT_NAME=SideStore-0.6.3-$suffix" >> "$GITHUB_ENV"
-          echo "VARIANT_TAG=0.6.3-$suffix" >> "$GITHUB_ENV"
-          echo "building variant: $suffix (patch mode: $PATCH_MODE)"
+          # v6 = AltSign request headers + response parsing fixed as well.
+          # The series is part of both the file name and the release tag so a
+          # rerun never silently overwrites an earlier build.
+          series="v6"
+          echo "IPA_NAME=SideStore-0.6.3-$suffix-$series.ipa" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=SideStore-0.6.3-$suffix-$series" >> "$GITHUB_ENV"
+          echo "VARIANT_TAG=0.6.3-$suffix-$series" >> "$GITHUB_ENV"
+          echo "building variant: $suffix-$series (patch mode: $PATCH_MODE)"
 
       - name: Checkout 0.6.3 (with submodules)
         uses: actions/checkout@v4
@@ -80,8 +84,10 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+
       - name: Apply login fix (official client info + crash hardening)
         run: |
+          set -euo pipefail
           cat > "$RUNNER_TEMP/fix063.py" <<'PYEOF'
           #!/usr/bin/env python3
           """Backport the Apple sign-in fix onto a 0.6.3 checkout.
@@ -585,7 +591,216 @@ jobs:
           sys.exit(main())
           PYEOF
           python3 "$RUNNER_TEMP/fix063.py"
+      - name: Patch AltSign login request (headers + response parsing)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fix_altsign.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Patch the AltSign submodule so 0.6.3's login request matches upstream SideSign.
 
+          0.6.3 does not talk to Apple itself: it hands the anisette data to
+          `ALTAppleAPI.authenticate` in the AltSign submodule, and that code carries a
+          2018-era User-Agent and only knows how to parse plists. Apple now answers with
+          something that is not a plist, so AltSign throws NSError 3840
+          ("The data couldn't be read because it isn't in the correct format.").
+
+          Upstream never fixed AltSign - they rewrote the whole login stack as the
+          SideSign package (used by 0.7.0-alpha / nightly). This script back-ports the
+          five differences that actually matter, plus a diagnostic error so a future
+          failure tells us what Apple returned instead of a generic message.
+
+          File patched: Dependencies/AltSign/AltSign/Sources/ALTAppleAPI+Authentication.swift
+          Skipped entirely when PATCH_MODE=none (control build).
+          """
+
+          import os
+          import sys
+
+          TARGET = "Dependencies/AltSign/AltSign/Sources/ALTAppleAPI+Authentication.swift"
+
+          # Verbatim from SideSign/Sources/Constants.swift (GrandSlam.userAgent).
+          OFFICIAL_UA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)"
+          # SideStore/Core/Anisette/AnisetteConfigManager.swift:
+          #   return loadConfig().customXcodeVersion ?? "26.0 (26A242)"
+          OFFICIAL_XCODE_VERSION = "26.0 (26A242)"
+
+          HELPERS = """    /// Upstream SideSign accepts either format; the original code only accepted
+              /// plists and blew up with NSError 3840 whenever Apple answered differently.
+              /// Declared `fileprivate` on purpose: the call sites live in another
+              /// extension of ALTAppleAPI, and relying on `private`'s cross-extension
+              /// scoping rules is exactly the kind of thing that fails to compile.
+              fileprivate static func ss_parsePlistOrJSON(_ data: Data) -> [String: Any]? {
+                  if let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+                     let dictionary = plist as? [String: Any]
+                  {
+                      return dictionary
+                  }
+                  if let json = try? JSONSerialization.jsonObject(with: data, options: []),
+                     let dictionary = json as? [String: Any]
+                  {
+                      return dictionary
+                  }
+                  return nil
+              }
+
+              /// Surface Apple's actual answer (status code + first bytes) in the alert the
+              /// user sees, so a failure can be diagnosed without a device log.
+              fileprivate static func ss_diagnosticError(_ prefix: String, statusCode: Int, data: Data) -> NSError {
+                  var snippet = String(data: data.prefix(200), encoding: .utf8) ?? ""
+                  snippet = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if snippet.isEmpty {
+                      snippet = data.prefix(64).map { String(format: "%02x", $0) }.joined()
+                  }
+                  let message = "\\(prefix) [HTTP \\(statusCode)] \\(snippet)"
+                  return NSError(domain: ALTUnderlyingAppleAPIErrorDomain, code: -1,
+                                 userInfo: [NSLocalizedDescriptionKey: message])
+              }
+          """
+
+          # (label, old, new) - every old block must be found exactly once.
+          REPLACEMENTS = [
+              (
+                  "1. auth request: modern User-Agent + Connection: close",
+                  """            let httpHeaders = [
+                          "Content-Type": "text/x-xml-plist",
+                          "X-MMe-Client-Info": anisetteData.deviceDescription,
+                          "Accept": "*/*",
+                          "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"
+                      ]""",
+                  """            let httpHeaders = [
+                          "Content-Type": "text/x-xml-plist",
+                          "X-MMe-Client-Info": anisetteData.deviceDescription,
+                          "Accept": "*/*",
+                          "User-Agent": "%s",
+                          "Connection": "close"
+                      ]""" % OFFICIAL_UA,
+              ),
+              (
+                  "2. auth response: accept plist or JSON, report Apple's raw answer",
+                  """                    guard let data = data else { throw error ?? ALTAppleAPIError.unknown() }
+                              
+                              guard let responseDictionary = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                                    let dictionary = responseDictionary["Response"] as? [String: Any],
+                                    let status = dictionary["Status"] as? [String: Any]
+                              else { throw URLError(.badServerResponse) }""",
+                  """                    guard let data = data else { throw error ?? ALTAppleAPIError.unknown() }
+                              
+                              let httpStatusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                              
+                              if data.isEmpty {
+                                  throw Self.ss_diagnosticError("Apple 登录服务返回了空响应", statusCode: httpStatusCode, data: data)
+                              }
+                              
+                              guard let responseDictionary = Self.ss_parsePlistOrJSON(data),
+                                    let dictionary = responseDictionary["Response"] as? [String: Any],
+                                    let status = dictionary["Status"] as? [String: Any]
+                              else {
+                                  throw Self.ss_diagnosticError("无法解析 Apple 登录服务的响应（既不是 plist 也不是 JSON）", statusCode: httpStatusCode, data: data)
+                              }""",
+              ),
+              (
+                  "3. decrypted spd payload: accept plist or JSON",
+                  """                            guard let decryptedDictionary = try PropertyListSerialization.propertyList(from: decryptedData, format: nil) as? [String: Any],""",
+                  """                            guard let decryptedDictionary = Self.ss_parsePlistOrJSON(decryptedData),""",
+              ),
+              (
+                  "4a. client dictionary: locale comes from the anisette server",
+                  """                "loc": Locale.current.identifier,""",
+                  """                "loc": anisetteData.locale.identifier,""",
+              ),
+              (
+                  "4b. client dictionary: X-Apple-Locale from the anisette server",
+                  """                "X-Apple-Locale": Locale.current.identifier,""",
+                  """                "X-Apple-Locale": anisetteData.locale.identifier,""",
+              ),
+              (
+                  "4c. client dictionary: time zone from the anisette server",
+                  """                "X-Apple-I-TimeZone": TimeZone.current.abbreviation() ?? "PST\"""",
+                  """                "X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation() ?? "PST\"""",
+              ),
+              (
+                  "5a. two-factor request: current Xcode version",
+                  """            "X-Xcode-Version": "11.2 (11B41)",""",
+                  """            "X-Xcode-Version": "%s",""" % OFFICIAL_XCODE_VERSION,
+              ),
+              (
+                  "5b. two-factor request: add serial number + Connection: close",
+                  """            "X-Apple-Locale": anisetteData.locale.identifier,
+                      "X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation() ?? "PST"
+                  ]""",
+                  """            "X-Apple-Locale": anisetteData.locale.identifier,
+                      "X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation() ?? "PST",
+                      "X-Apple-I-SRL-NO": anisetteData.deviceSerialNumber,
+                      "Connection": "close"
+                  ]""",
+              ),
+          ]
+
+
+          def main():
+              mode = os.environ.get("PATCH_MODE", "official")
+              if mode == "none":
+                  print("= control build requested: AltSign left untouched")
+                  return 0
+
+              if not os.path.isfile(TARGET):
+                  print("ERROR: %s not found (run me from the repo root)" % TARGET)
+                  return 1
+
+              with open(TARGET, encoding="utf-8") as f:
+                  src = f.read()
+              original = src
+
+              # Own extension (not the private one) so the two helpers are plain
+              # fileprivate members callable from every other extension in this file.
+              anchor = "private extension ALTAppleAPI {\n    func sendAuthenticationRequest("
+              if src.count(anchor) != 1:
+                  print("ERROR: expected exactly one private-extension anchor, found %d" % src.count(anchor))
+                  return 1
+              helper_block = "extension ALTAppleAPI {\n" + HELPERS + "}\n\n"
+              src = src.replace(anchor, helper_block + anchor)
+              print("+ inserted ss_parsePlistOrJSON / ss_diagnosticError helpers")
+
+              failures = []
+              for label, old, new in REPLACEMENTS:
+                  count = src.count(old)
+                  if count != 1:
+                      failures.append("%s -> expected 1 match, found %d" % (label, count))
+                      print("! %s: expected 1 match, found %d" % (label, count))
+                  else:
+                      src = src.replace(old, new)
+                      print("+ %s" % label)
+
+              if failures:
+                  print("\nERROR: %d replacement(s) did not apply:" % len(failures))
+                  for f in failures:
+                      print("  - %s" % f)
+                  return 1
+
+              if src == original:
+                  print("ERROR: nothing changed")
+                  return 1
+
+              with open(TARGET, "w", encoding="utf-8") as f:
+                  f.write(src)
+
+              braces = src.count("{") - src.count("}")
+              parens = src.count("(") - src.count(")")
+              print("  braces balance %d, parens balance %d" % (braces, parens))
+              print("  old UA left: %d | new UA present: %d" % (
+                  src.count("akd/1.0 CFNetwork"),
+                  src.count(OFFICIAL_UA),
+              ))
+              print("= patched %s" % TARGET)
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python3 "$RUNNER_TEMP/fix_altsign.py"
+          git -C Dependencies/AltSign --no-pager diff --stat
       - name: Show patch
         run: git --no-pager diff
 
