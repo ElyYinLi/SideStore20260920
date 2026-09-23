@@ -1,0 +1,295 @@
+name: Build SideStore 0.6.3 + login fix
+
+# Builds the 0.6.3 tag with the Apple sign-in (503) fix applied:
+#   the anisette client marker (com.apple.dt.Xcode/...) is rewritten to
+#   (com.apple.akd/1.0), same fix as upstream 0.7.0-alpha.
+# 0.6.3 is kept because its refresh / VPN flow still works on iOS 17.x.
+#
+# Output: Actions artifact "SideStore-0.6.3-loginfix" + GitHub Release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-063-login-fix.yml'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner image (macos-26 or macos-15)'
+        required: false
+        default: 'macos-26'
+      xcode:
+        description: 'Xcode version'
+        required: false
+        default: '26.4'
+      publish_release:
+        description: 'Also publish the IPA as a GitHub Release'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-063-login-fix
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: 0.6.3-loginfix
+      # The only em_proxy release that still ships libem_proxy-*.a / em_proxy.h.
+      EM_PROXY_BASE: https://github.com/SideStore/em_proxy/releases/download/build
+
+    steps:
+      - name: Checkout 0.6.3 (with submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: '0.6.3'
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply login fix (anisette client Xcode -> akd)
+        run: |
+          cat > "$RUNNER_TEMP/fix063.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Backport the Apple sign-in (503) fix onto a 0.6.3 checkout.
+
+          Apple rejects GrandSlam requests whose X-MMe-Client-Info / User-Agent
+          still carry the (com.apple.dt.Xcode/...) marker -> HTTP 503 on sign-in.
+          Upstream 0.7.0-alpha switched the marker to (com.apple.akd/1.0).
+          This applies that change to 0.6.3 - the last version whose refresh /
+          VPN flow still works on iOS 17.x.
+          """
+          import re
+          import sys
+          from pathlib import Path
+
+          TARGET = Path("AltStore/Operations/FetchAnisetteDataOperation.swift")
+
+          HELPERS = r'''    // MARK: - Apple 503 fix (Xcode -> akd)
+
+              /// Apple rejects requests whose client info / user agent still carries
+              /// the `(com.apple.dt.Xcode/...)` marker: sign-in fails with HTTP 503.
+              /// Rewrite it to the `(com.apple.akd/1.0)` marker used upstream.
+              static func sanitizedAppleString(_ raw: String) -> String {
+                  let pattern = #"\(com\.apple\.dt\.Xcode/[^)]*\)"#
+                  guard let regex = try? NSRegularExpression(pattern: pattern) else { return raw }
+                  let range = NSRange(raw.startIndex..., in: raw)
+                  return regex.stringByReplacingMatches(
+                      in: raw,
+                      options: [],
+                      range: range,
+                      withTemplate: "(com.apple.akd/1.0)"
+                  )
+              }
+
+              /// adi.pb is bound to the client info it was provisioned with, so an
+              /// identity provisioned with the (now rejected) Xcode marker has to be
+              /// discarded once before we provision again with the akd marker.
+              static func migrateAnisetteClientIfNeeded() {
+                  let migrationKey = "AnisetteClientMigratedToAKD"
+                  guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+                  Keychain.shared.adiPb = nil
+                  UserDefaults.standard.set(true, forKey: migrationKey)
+              }
+
+          '''
+
+          ASSIGNMENTS = [
+              (
+                  "client_info",
+                  r'^([ \t]*)self\.clientInfo = clientInfo$',
+                  r'\g<1>self.clientInfo = Self.sanitizedAppleString(clientInfo)',
+                  'self.clientInfo = Self.sanitizedAppleString(clientInfo)',
+              ),
+              (
+                  "user_agent",
+                  r'^([ \t]*)self\.userAgent = json\["user_agent"\]!$',
+                  r'\g<1>self.userAgent = Self.sanitizedAppleString(json["user_agent"]!)',
+                  'self.userAgent = Self.sanitizedAppleString(json["user_agent"]!)',
+              ),
+          ]
+
+
+          def sanitize(src, label, pattern, repl, already):
+              if already in src:
+                  print("= %s assignment already sanitized" % label)
+                  return src
+              new_src, count = re.subn(pattern, repl, src, flags=re.MULTILINE)
+              if count == 0:
+                  print("ERROR: cannot find the %s assignment" % label)
+                  return None
+              print("+ sanitized the %s assignment" % label)
+              return new_src
+
+
+          def main():
+              if not TARGET.is_file():
+                  print("ERROR: %s not found (run me from the repo root)" % TARGET)
+                  return 1
+
+              src = TARGET.read_text(encoding="utf-8")
+              original = src
+
+              # 1. helper methods, inserted right before the COMMON section
+              if "sanitizedAppleString" in src:
+                  print("= helper methods already present")
+              else:
+                  anchor = "    // MARK: - COMMON"
+                  if anchor not in src:
+                      print("ERROR: missing the '// MARK: - COMMON' anchor")
+                      return 1
+                  src = src.replace(anchor, HELPERS + anchor, 1)
+                  print("+ inserted sanitizedAppleString() / migrateAnisetteClientIfNeeded()")
+
+              # 2. run the migration at the start of main()
+              if "Self.migrateAnisetteClientIfNeeded()" in src:
+                  print("= migration call already present")
+              else:
+                  anchor = "        super.main()\n"
+                  if anchor not in src:
+                      print("ERROR: missing 'super.main()'")
+                      return 1
+                  injected = (
+                      anchor
+                      + "        \n"
+                      + "        // Apple 503 fix: drop the adi.pb that was provisioned with the\n"
+                      + "        // (now rejected) Xcode marker, so we re-provision with the akd one.\n"
+                      + "        Self.migrateAnisetteClientIfNeeded()\n"
+                  )
+                  src = src.replace(anchor, injected, 1)
+                  print("+ hooked migrateAnisetteClientIfNeeded() into main()")
+
+              # 3. sanitize whatever client_info / user_agent the server reports
+              for label, pattern, repl, already in ASSIGNMENTS:
+                  src = sanitize(src, label, pattern, repl, already)
+                  if src is None:
+                      return 1
+
+              if src == original:
+                  print("nothing to do, tree already patched")
+                  return 0
+
+              TARGET.write_text(src, encoding="utf-8")
+              print("patched %s" % TARGET)
+              return 0
+
+
+          sys.exit(main())
+          PYEOF
+          python3 "$RUNNER_TEMP/fix063.py"
+
+      - name: Show patch
+        run: git --no-pager diff
+
+      # SideStore's Xcode build phase runs Dependencies/*/fetch-prebuilt.sh,
+      # which pulls em_proxy.swift + libem_proxy-*.a + em_proxy.h from
+      # releases/latest. That release (v0.9.3) no longer ships those files, so
+      # wget writes 404 pages over them -> "module 'em_proxy' has no member
+      # named 'start_em_proxy'". Neutralise the fetchers, then pin the real
+      # files from the em_proxy release that matches 0.6.3 (tag "build").
+      - name: Pin em_proxy prebuilt (and stop the auto-fetch clobbering it)
+        run: |
+          set -euo pipefail
+
+          # 1. Neutralise every fetch-prebuilt.sh so nothing gets overwritten.
+          for f in Dependencies/*/fetch-prebuilt.sh; do
+            [ -f "$f" ] || continue
+            printf '#!/usr/bin/env bash\necho "[ci] %s disabled: prebuilt files are pinned."\nexit 0\n' "$f" > "$f"
+            chmod +x "$f"
+            echo "disabled: $f"
+          done
+
+          # 2. Skip markers in every directory the script might be invoked from.
+          mkdir -p SideStore
+          touch .skip-prebuilt-fetch-em_proxy \
+                SideStore/.skip-prebuilt-fetch-em_proxy \
+                Dependencies/em_proxy/.skip-prebuilt-fetch-em_proxy
+
+          # 3. Fetch the real artifacts; keep the submodule's own em_proxy.swift.
+          cd Dependencies/em_proxy
+          for f in libem_proxy-ios.a libem_proxy-sim.a em_proxy.h; do
+            curl -fL -o "$f" "$EM_PROXY_BASE/$f" || { echo "ERROR: download failed: $f"; exit 1; }
+          done
+
+          # 4. Make sure we did not just save a 404 page.
+          for f in libem_proxy-ios.a libem_proxy-sim.a em_proxy.h; do
+            if head -c 400 "$f" | grep -qiE '<!doctype|<html|404: not found'; then
+              echo "ERROR: $f is an error page, not a real artifact"
+              head -c 400 "$f"
+              exit 1
+            fi
+          done
+
+          grep -q "start_em_proxy" em_proxy.h     || { echo "ERROR: em_proxy.h has no start_em_proxy"; exit 1; }
+          grep -q "start_em_proxy" em_proxy.swift || { echo "ERROR: em_proxy.swift has no start_em_proxy"; exit 1; }
+          echo "em_proxy OK:"
+          ls -la libem_proxy-ios.a libem_proxy-sim.a em_proxy.h em_proxy.swift
+
+      - name: Install build tools
+        run: brew install ldid xcbeautify
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: ${{ inputs.xcode || '26.4' }}
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Build archive
+        run: |
+          set -o pipefail
+          make -B build 2>&1 | tee "$RUNNER_TEMP/build.log" || {
+            echo "===== ERROR LINES ====="
+            grep -nE "error:|fatal error:|No such module|errors? generated" "$RUNNER_TEMP/build.log" | head -40
+            echo "===== MINIMUXER CHECK ====="
+            ls -la Dependencies/minimuxer/RustBridge/lib/RustBridge.xcframework || echo "minimuxer xcframework MISSING"
+            echo "===== EM_PROXY RECHECK ====="
+            ls -la Dependencies/em_proxy/
+            grep -n "start_em_proxy" Dependencies/em_proxy/em_proxy.swift || echo "em_proxy.swift CLOBBERED"
+            exit 1
+          }
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+
+      - name: Fakesign (ldid)
+        run: make fakesign
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          make ipa
+          test -f SideStore.ipa || { echo "ERROR: make ipa did not produce SideStore.ipa"; exit 1; }
+          cp SideStore.ipa "SideStore-$TAG.ipa"
+          ls -lh "SideStore-$TAG.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-0.6.3-loginfix
+          path: SideStore-0.6.3-loginfix.ipa
+          if-no-files-found: error
+
+      - name: Publish Release
+        if: ${{ (inputs.publish_release || 'true') == 'true' }}
+        continue-on-error: true
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "SideStore-$TAG.ipa" --clobber
+          else
+            gh release create "$TAG" \
+              --target 0.6.3 \
+              --title "SideStore 0.6.3 + Apple 登录修复" \
+              --notes "0.6.3 代码 + anisette client 从 (com.apple.dt.Xcode/...) 改写为 (com.apple.akd/1.0)，修复登录 503。首次登录会自动清除旧的 adi.pb 并重新 provisioning；若仍失败，到 Settings -> Anisette Servers -> Reset adi.pb 后再登录。" \
+              "SideStore-$TAG.ipa"
+          fi
