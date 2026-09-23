@@ -1,0 +1,221 @@
+name: Build SideStore 0.6.3 + login fix
+
+# Builds the 0.6.3 tag with the Apple sign-in (503) fix applied:
+#   the anisette client marker (com.apple.dt.Xcode/...) is rewritten to
+#   (com.apple.akd/1.0), same fix as upstream 0.7.0-alpha (commit d7565c9).
+# 0.6.3 is kept because its VPN/refresh flow still works on iOS 17.x.
+#
+# Output: Actions artifact "SideStore-0.6.3-loginfix" (and a GitHub Release).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-063-login-fix.yml'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner image (macos-26 or macos-15)'
+        required: false
+        default: 'macos-26'
+      xcode:
+        description: 'Xcode version'
+        required: false
+        default: '26.4'
+      publish_release:
+        description: 'Also publish the IPA as a GitHub Release'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-063-login-fix
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: 0.6.3-loginfix
+
+    steps:
+      - name: Checkout 0.6.3 (with submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: '0.6.3'
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply login fix (anisette client Xcode -> akd)
+        run: |
+          cat > "$RUNNER_TEMP/fix063.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Backport the Apple sign-in (503) fix onto a 0.6.3 checkout.
+
+          Apple rejects GrandSlam requests whose X-MMe-Client-Info still carries
+          the (com.apple.dt.Xcode/...) marker -> HTTP 503 on sign-in.
+          Upstream 0.7.0-alpha (commit d7565c9, same as AltStore PR #1790)
+          switched the marker to (com.apple.akd/1.0). This applies that change
+          to 0.6.3, which is still the last version whose refresh/VPN flow
+          works on iOS 17.x.
+          """
+          import re
+          import sys
+          from pathlib import Path
+
+          TARGET = Path("AltStore/Operations/FetchAnisetteDataOperation.swift")
+
+          HELPERS = r'''    // MARK: - Apple 503 fix (Xcode -> akd)
+
+              /// Apple rejects `X-MMe-Client-Info` when it carries the
+              /// `(com.apple.dt.Xcode/...)` marker: sign-in fails with HTTP 503.
+              /// Rewrite it to the `(com.apple.akd/1.0)` marker used upstream.
+              static func sanitizedClientInfo(_ rawClientInfo: String) -> String {
+                  let pattern = #"\(com\.apple\.dt\.Xcode/[^)]*\)"#
+                  guard let regex = try? NSRegularExpression(pattern: pattern) else { return rawClientInfo }
+                  let range = NSRange(rawClientInfo.startIndex..., in: rawClientInfo)
+                  return regex.stringByReplacingMatches(
+                      in: rawClientInfo,
+                      options: [],
+                      range: range,
+                      withTemplate: "(com.apple.akd/1.0)"
+                  )
+              }
+
+              /// adi.pb and the identifier are bound to the client info they were
+              /// provisioned with, so an identity provisioned with the rejected
+              /// Xcode marker has to be discarded (once) before signing in again.
+              static func migrateAnisetteClientIfNeeded() {
+                  let migrationKey = "AnisetteClientMigratedToAKD"
+                  guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+                  Keychain.shared.adiPb = nil
+                  Keychain.shared.identifier = nil
+                  UserDefaults.standard.set(true, forKey: migrationKey)
+              }
+
+          '''
+
+          def main():
+              if not TARGET.is_file():
+                  print("ERROR: %s not found (run me from the repo root)" % TARGET)
+                  return 1
+
+              src = TARGET.read_text(encoding="utf-8")
+              original = src
+
+              # 1. helper methods, inserted right before the COMMON section
+              if "sanitizedClientInfo" in src:
+                  print("= helper methods already present")
+              else:
+                  anchor = "    // MARK: - COMMON"
+                  if anchor not in src:
+                      print("ERROR: missing the '// MARK: - COMMON' anchor")
+                      return 1
+                  src = src.replace(anchor, HELPERS + anchor, 1)
+                  print("+ inserted sanitizedClientInfo() / migrateAnisetteClientIfNeeded()")
+
+              # 2. run the migration at the start of main()
+              if "Self.migrateAnisetteClientIfNeeded()" in src:
+                  print("= migration call already present")
+              else:
+                  anchor = "        super.main()\n"
+                  if anchor not in src:
+                      print("ERROR: missing 'super.main()'")
+                      return 1
+                  injected = (
+                      anchor
+                      + "        \n"
+                      + "        // Apple 503 fix: drop an identity provisioned with the (now rejected)\n"
+                      + "        // Xcode client marker, so we re-provision with the akd marker.\n"
+                      + "        Self.migrateAnisetteClientIfNeeded()\n"
+                  )
+                  src = src.replace(anchor, injected, 1)
+                  print("+ hooked migrateAnisetteClientIfNeeded() into main()")
+
+              # 3. sanitize whatever client_info the anisette server reports
+              new_src, count = re.subn(
+                  r"^([ \t]*)self\.clientInfo = clientInfo$",
+                  lambda m: m.group(1) + "self.clientInfo = Self.sanitizedClientInfo(clientInfo)",
+                  src,
+                  flags=re.MULTILINE,
+              )
+              if count:
+                  src = new_src
+                  print("+ sanitized the clientInfo assignment")
+              elif "self.clientInfo = Self.sanitizedClientInfo(clientInfo)" in src:
+                  print("= clientInfo assignment already sanitized")
+              else:
+                  print("ERROR: missing 'self.clientInfo = clientInfo'")
+                  return 1
+
+              if src == original:
+                  print("nothing to do, tree already patched")
+                  return 0
+
+              TARGET.write_text(src, encoding="utf-8")
+              print("patched %s" % TARGET)
+              return 0
+
+          sys.exit(main())
+          PYEOF
+          python3 "$RUNNER_TEMP/fix063.py"
+
+      - name: Show patch
+        run: git --no-pager diff
+
+      - name: Install build tools
+        run: brew install ldid xcbeautify
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: ${{ inputs.xcode || '26.4' }}
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Build archive
+        run: |
+          set -o pipefail
+          make -B build 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+
+      - name: Fakesign (ldid)
+        run: make fakesign
+
+      - name: Package IPA
+        run: |
+          make ipa
+          cp SideStore.ipa "SideStore-$TAG.ipa"
+          ls -lh "SideStore-$TAG.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-0.6.3-loginfix
+          path: SideStore-0.6.3-loginfix.ipa
+          if-no-files-found: error
+
+      - name: Publish Release
+        if: ${{ (inputs.publish_release || 'true') == 'true' }}
+        continue-on-error: true
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "SideStore-$TAG.ipa" --clobber
+          else
+            gh release create "$TAG" \
+              --target 0.6.3 \
+              --title "SideStore 0.6.3 + Apple 登录修复" \
+              --notes "0.6.3 代码 + anisette client 从 (com.apple.dt.Xcode/...) 改写为 (com.apple.akd/1.0)，修复登录 503。首次登录会自动清除旧的 adi.pb 并重新 provisioning；若仍失败，到 Settings -> Anisette Servers -> Reset adi.pb 后再登录。" \
+              "SideStore-$TAG.ipa"
+          fi
