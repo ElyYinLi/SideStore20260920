@@ -224,8 +224,29 @@ jobs:
             fi
           done
 
-          grep -q "start_em_proxy" em_proxy.h     || { echo "ERROR: em_proxy.h has no start_em_proxy"; exit 1; }
-          grep -q "start_em_proxy" em_proxy.swift || { echo "ERROR: em_proxy.swift has no start_em_proxy"; exit 1; }
+          # 5. Symbol sanity check. The naming here is asymmetric and it is
+          #    exactly what killed the two previous runs:
+          #      em_proxy.h     -> Rust/C names:  start_emotional_damage / stop_emotional_damage
+          #      em_proxy.swift -> Swift wrapper: start_em_proxy         / stop_em_proxy
+          #    So do NOT grep for start_em_proxy in the header.
+          grep -q "start_emotional_damage" em_proxy.h || {
+            echo "ERROR: em_proxy.h has no start_emotional_damage"; sed -n '1,40p' em_proxy.h; exit 1; }
+          grep -q "stop_emotional_damage" em_proxy.h || {
+            echo "ERROR: em_proxy.h has no stop_emotional_damage"; sed -n '1,40p' em_proxy.h; exit 1; }
+          grep -q "start_em_proxy" em_proxy.swift || {
+            echo "ERROR: em_proxy.swift has no start_em_proxy"; sed -n '1,40p' em_proxy.swift; exit 1; }
+
+          # 6. The .a files are fat Mach-O archives (magic cafebabe), NOT ar
+          #    archives (magic !<arch>), so only check a size floor and print
+          #    what they actually are for later diagnosis.
+          for f in libem_proxy-ios.a libem_proxy-sim.a; do
+            file "$f" || true
+            lipo -info "$f" || true
+            size=$(wc -c < "$f" | tr -d ' ')
+            echo "$f size=$size bytes"
+            [ "$size" -gt 1000000 ] || { echo "ERROR: $f suspiciously small"; head -c 200 "$f"; exit 1; }
+          done
+
           echo "em_proxy OK:"
           ls -la libem_proxy-ios.a libem_proxy-sim.a em_proxy.h em_proxy.swift
 
@@ -261,6 +282,17 @@ jobs:
           name: build-log
           path: ${{ runner.temp }}/build.log
           if-no-files-found: ignore
+
+      - name: Inspect archive before fakesign
+        run: |
+          set -uo pipefail
+          APP=SideStore.xcarchive/Products/Applications/SideStore.app
+          echo "===== APP DIR ====="
+          ls -la "$APP" || { echo "ERROR: $APP missing"; exit 1; }
+          echo "===== FRAMEWORKS ====="
+          ls -la "$APP/Frameworks" || echo "(no Frameworks dir)"
+          echo "===== PLUGINS ====="
+          ls -la "$APP/PlugIns" || echo "(no PlugIns dir)"
 
       - name: Fakesign (ldid)
         run: make fakesign
