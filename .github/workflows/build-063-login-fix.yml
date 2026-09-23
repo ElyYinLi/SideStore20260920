@@ -1,11 +1,15 @@
 name: Build SideStore 0.6.3 + login fix
 
-# Builds the 0.6.3 tag with the Apple sign-in (503) fix applied:
-#   the anisette client marker (com.apple.dt.Xcode/...) is rewritten to
-#   (com.apple.akd/1.0), same fix as upstream 0.7.0-alpha.
+# Builds the 0.6.3 tag with the Apple sign-in fix applied.
+#
+# Upstream (0.7.0 nightly) did NOT switch the marker to akd: it bumped the
+# client info / user agent to the current macOS 26.6 / Xcode 26.0 values.
+# On top of that, 0.6.3 force-unwraps half of the anisette flow, so any
+# unexpected server reply traps (EXC_BREAKPOINT) instead of showing an
+# error - the patch also makes that path fail loudly instead of crashing.
 # 0.6.3 is kept because its refresh / VPN flow still works on iOS 17.x.
 #
-# Output: Actions artifact "SideStore-0.6.3-loginfix" + GitHub Release.
+# Variants: official (default) / server / none (control build).
 
 on:
   push:
@@ -29,11 +33,11 @@ on:
       patch_mode:
         description: 'How much of the login fix to apply'
         required: false
-        default: 'full'
+        default: 'official'
         type: choice
         options:
-          - full
-          - strings
+          - official
+          - server
           - none
 
 permissions:
@@ -48,10 +52,10 @@ jobs:
     runs-on: ${{ inputs.runner || 'macos-26' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # full    = string rewrite + clear the stale adi.pb once
-      # strings = string rewrite only (keeps whatever adi.pb is there)
-      # none    = untouched 0.6.3, used as a control build
-      PATCH_MODE: ${{ inputs.patch_mode || 'full' }}
+      # official = safety rewrite + official client info/user agent + clear the stale adi.pb once
+      # server   = safety rewrite only (keeps whatever the anisette server reports)
+      # none     = untouched 0.6.3, used as a control build
+      PATCH_MODE: ${{ inputs.patch_mode || 'official' }}
       # The only em_proxy release that still ships libem_proxy-*.a / em_proxy.h.
       EM_PROXY_BASE: https://github.com/SideStore/em_proxy/releases/download/build
 
@@ -59,9 +63,9 @@ jobs:
       - name: Resolve variant names
         run: |
           case "$PATCH_MODE" in
-            full)    suffix="loginfix" ;;
-            strings) suffix="strings-only" ;;
-            none)    suffix="clean" ;;
+            official) suffix="official" ;;
+            server)   suffix="server" ;;
+            none)     suffix="clean" ;;
             *) echo "ERROR: unknown PATCH_MODE=$PATCH_MODE"; exit 1 ;;
           esac
           echo "IPA_NAME=SideStore-0.6.3-$suffix.ipa" >> "$GITHUB_ENV"
@@ -76,146 +80,509 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Apply login fix (anisette client Xcode -> akd)
+      - name: Apply login fix (official client info + crash hardening)
         run: |
           cat > "$RUNNER_TEMP/fix063.py" <<'PYEOF'
-          #!/usr/bin/env python3
-          """Backport the Apple sign-in (503) fix onto a 0.6.3 checkout.
+            #!/usr/bin/env python3
+            """Backport the Apple sign-in fix onto a 0.6.3 checkout.
 
-          Apple rejects GrandSlam requests whose X-MMe-Client-Info / User-Agent
-          still carry the (com.apple.dt.Xcode/...) marker -> HTTP 503 on sign-in.
-          Upstream 0.7.0-alpha switched the marker to (com.apple.akd/1.0).
-          This applies that change to 0.6.3 - the last version whose refresh /
-          VPN flow still works on iOS 17.x.
-          """
-          import os
-          import re
-          import sys
-          from pathlib import Path
+            What upstream actually did (0.7.0 nightly, Sept 2026) is NOT switching the
+            marker to akd - it bumped the client info / user agent to the current macOS
+            26.6 / Xcode 26.0 values. This patch does that, and additionally removes the
+            force unwraps that make 0.6.3 crash (EXC_BREAKPOINT on the NSURLSession
+            delegate queue) instead of showing an error.
 
-          TARGET = Path("AltStore/Operations/FetchAnisetteDataOperation.swift")
+            Modes:
+              official -> safety rewrite + official client info/user agent + reset adi.pb
+              server   -> safety rewrite only (keep whatever the anisette server reports)
+              none     -> untouched 0.6.3 (control build)
+            """
+            import os
+            import sys
+            from pathlib import Path
 
-          HELPERS = r'''    // MARK: - Apple 503 fix (Xcode -> akd)
+            TARGET = Path("AltStore/Operations/FetchAnisetteDataOperation.swift")
 
-              /// Apple rejects requests whose client info / user agent still carries
-              /// the `(com.apple.dt.Xcode/...)` marker: sign-in fails with HTTP 503.
-              /// Rewrite it to the `(com.apple.akd/1.0)` marker used upstream.
-              static func sanitizedAppleString(_ raw: String) -> String {
-                  let pattern = #"\(com\.apple\.dt\.Xcode/[^)]*\)"#
-                  guard let regex = try? NSRegularExpression(pattern: pattern) else { return raw }
-                  let range = NSRange(raw.startIndex..., in: raw)
-                  return regex.stringByReplacingMatches(
-                      in: raw,
-                      options: [],
-                      range: range,
-                      withTemplate: "(com.apple.akd/1.0)"
-                  )
-              }
+            CLIENT_INFO = r'''    // MARK: - Apple sign-in fix (official client info + crash hardening)
 
-              /// adi.pb is bound to the client info it was provisioned with, so an
-              /// identity provisioned with the (now rejected) Xcode marker has to be
-              /// discarded once before we provision again with the akd marker.
-              static func migrateAnisetteClientIfNeeded() {
-                  let migrationKey = "AnisetteClientMigratedToAKD"
-                  guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
-                  Keychain.shared.adiPb = nil
-                  UserDefaults.standard.set(true, forKey: migrationKey)
-              }
+                /// The client info / user agent upstream ships today (0.7.0 nightly).
+                /// Apple rejects sign-in (HTTP 503) when these still carry the old
+                /// (com.apple.dt.Xcode/<old version>) marker, so pin the current values.
+                static let appleClientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/26.0)>"
+                static let appleUserAgent = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)"
 
-          '''
+                /// Anisette servers occasionally report non-string values; read them
+                /// defensively instead of trapping on a failed downcast.
+                static func stringValue(_ any: Any?) -> String? {
+                    if let string = any as? String { return string }
+                    if let number = any as? NSNumber { return number.stringValue }
+                    return nil
+                }
 
-          ASSIGNMENTS = [
-              (
-                  "client_info",
-                  r'^([ \t]*)self\.clientInfo = clientInfo$',
-                  r'\g<1>self.clientInfo = Self.sanitizedAppleString(clientInfo)',
-                  'self.clientInfo = Self.sanitizedAppleString(clientInfo)',
-              ),
-              (
-                  "user_agent",
-                  r'^([ \t]*)self\.userAgent = json\["user_agent"\]!$',
-                  r'\g<1>self.userAgent = Self.sanitizedAppleString(json["user_agent"]!)',
-                  'self.userAgent = Self.sanitizedAppleString(json["user_agent"]!)',
-              ),
-          ]
+                /// Data.object() traps when the buffer is shorter than the target type,
+                /// which is one of the crashes seen on device. Build the UUID safely.
+                static func safeUUIDString(from data: Data) -> String? {
+                    guard data.count >= 16 else { return nil }
+                    var bytes = [UInt8](repeating: 0, count: 16)
+                    data.copyBytes(to: &bytes, count: 16)
+                    return NSUUID(uuidBytes: bytes).uuidString.uppercased()
+                }
+
+                /// adi.pb is bound to the client info it was provisioned with, so an
+                /// identity provisioned with an old marker has to be discarded once.
+                static func resetAnisetteIdentityOnce() {
+                    let migrationKey = "AnisetteClientInfoMigrated2026"
+                    guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+                    Keychain.shared.adiPb = nil
+                    UserDefaults.standard.set(true, forKey: migrationKey)
+                }
+
+                private func ensureIdentifier() -> Bool {
+                    if let existing = Keychain.shared.identifier,
+                       let decoded = Data(base64Encoded: existing),
+                       decoded.count >= 16 {
+                        return true
+                    }
+                    self.printOut("Generating identifier")
+                    var bytes = [Int8](repeating: 0, count: 16)
+                    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                    if status != errSecSuccess {
+                        self.printOut("ERROR GENERATING IDENTIFIER!!! \(status)")
+                        return false
+                    }
+                    Keychain.shared.identifier = Data(bytes: &bytes, count: bytes.count).base64EncodedString()
+                    return true
+                }
+
+                private func deriveDeviceIdentifiers() -> Bool {
+                    guard ensureIdentifier(),
+                          let identifier = Keychain.shared.identifier,
+                          let decoded = Data(base64Encoded: identifier),
+                          decoded.count >= 16,
+                          let deviceId = Self.safeUUIDString(from: decoded) else {
+                        return false
+                    }
+                    self.mdLu = decoded.sha256().hexEncodedString()
+                    self.deviceId = deviceId
+                    self.printOut("X-Apple-I-MD-LU: \(self.mdLu ?? "none")")
+                    self.printOut("X-Mme-Device-Id: \(deviceId)")
+                    return true
+                }
+
+            '''
+
+            SAFETY = [
+                (
+                    "main(): error! on missing server",
+                    [
+                        '            guard let urlString = url else {',
+                        '                self.finish(.failure(error!))',
+                        '                return',
+                        '            }',
+                    ],
+                    [
+                        '            guard let urlString = url else {',
+                        '                self.finish(.failure(error ?? OperationError.anisetteV3Error(message: "No anisette server could be reached")))',
+                        '                return',
+                        '            }',
+                    ],
+                ),
+                (
+                    "main(): url! log line",
+                    ['            self.printOut("Anisette URL: \\(self.url!.absoluteString)")'],
+                    ['            self.printOut("Anisette URL: \\(self.url?.absoluteString ?? "none")")'],
+                ),
+                (
+                    "extractAnisetteData: [String: String] downcast",
+                    [
+                        '        if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: String] {',
+                    ],
+                    [
+                        '        if let rawJSON = try? JSONSerialization.jsonObject(with: data, options: []),',
+                        '           let anyJSON = rawJSON as? [String: Any] {',
+                        '            var json: [String: String] = [:]',
+                        '            for (jsonKey, jsonValue) in anyJSON {',
+                        '                if let jsonString = Self.stringValue(jsonValue) { json[jsonKey] = jsonString }',
+                        '            }',
+                    ],
+                ),
+                (
+                    "extractAnisetteData: v3 force unwraps",
+                    [
+                        '                formattedJSON["deviceDescription"] = self.clientInfo!',
+                        '                formattedJSON["localUserID"] = self.mdLu!',
+                        '                formattedJSON["deviceUniqueIdentifier"] = self.deviceId!',
+                    ],
+                    [
+                        '                guard let deviceDescription = self.clientInfo,',
+                        '                      let localUserID = self.mdLu,',
+                        '                      let deviceUniqueIdentifier = self.deviceId else {',
+                        '                    throw OperationError.anisetteV3Error(message: "Missing anisette client info (device description, local user id or device id)")',
+                        '                }',
+                        '                formattedJSON["deviceDescription"] = deviceDescription',
+                        '                formattedJSON["localUserID"] = localUserID',
+                        '                formattedJSON["deviceUniqueIdentifier"] = deviceUniqueIdentifier',
+                    ],
+                ),
+                (
+                    "fetchAnisetteV1: url!",
+                    ['        URLSession.shared.dataTask(with: self.url!) { data, response, error in'],
+                    [
+                        '        guard let requestURL = self.url else {',
+                        '            return self.finish(.failure(OperationError.anisetteV1Error(message: "No anisette server URL is available")))',
+                        '        }',
+                        '        URLSession.shared.dataTask(with: requestURL) { data, response, error in',
+                    ],
+                ),
+                (
+                    "provision: nested plist downcast",
+                    [
+                        '                if let data = data,',
+                        '                   let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? Dictionary<String, Dictionary<String, Any>>,',
+                        '                   let startProvisioningString = plist["urls"]?["midStartProvisioning"] as? String,',
+                        '                   let startProvisioningURL = URL(string: startProvisioningString),',
+                        '                   let endProvisioningString = plist["urls"]?["midFinishProvisioning"] as? String,',
+                        '                   let endProvisioningURL = URL(string: endProvisioningString) {',
+                    ],
+                    [
+                        '                if let data = data,',
+                        '                   let rawPlist = try? PropertyListSerialization.propertyList(from: data, format: nil),',
+                        '                   let plist = rawPlist as? Dictionary<String, Any>,',
+                        '                   let urls = plist["urls"] as? Dictionary<String, Any>,',
+                        '                   let startProvisioningString = urls["midStartProvisioning"] as? String,',
+                        '                   let startProvisioningURL = URL(string: startProvisioningString),',
+                        '                   let endProvisioningString = urls["midFinishProvisioning"] as? String,',
+                        '                   let endProvisioningURL = URL(string: endProvisioningString) {',
+                    ],
+                ),
+                (
+                    "provision: provisioning URL logs",
+                    [
+                        '                    self.printOut("startProvisioningURL: \\(self.startProvisioningURL!.absoluteString)")',
+                        '                    self.printOut("endProvisioningURL: \\(self.endProvisioningURL!.absoluteString)")',
+                    ],
+                    [
+                        '                    self.printOut("startProvisioningURL: \\(self.startProvisioningURL?.absoluteString ?? "none")")',
+                        '                    self.printOut("endProvisioningURL: \\(self.endProvisioningURL?.absoluteString ?? "none")")',
+                    ],
+                ),
+                (
+                    "startProvisioningSession: url!",
+                    [
+                        '        let provisioningSessionURL = self.url!.appendingPathComponent("v3").appendingPathComponent("provisioning_session")',
+                    ],
+                    [
+                        '        guard let baseURL = self.url else {',
+                        '            return self.finish(.failure(OperationError.provisioningError(result: "No anisette server URL is available", message: nil)))',
+                        '        }',
+                        '        let provisioningSessionURL = baseURL.appendingPathComponent("v3").appendingPathComponent("provisioning_session")',
+                    ],
+                ),
+                (
+                    "didReceive: websocket text downcast",
+                    [
+                        '                if let json = try JSONSerialization.jsonObject(with: string.data(using: .utf8)!, options: []) as? [String: Any] {',
+                    ],
+                    [
+                        '                if let messageData = string.data(using: .utf8),',
+                        '                   let rawJSON = try? JSONSerialization.jsonObject(with: messageData, options: []),',
+                        '                   let json = rawJSON as? [String: Any] {',
+                    ],
+                ),
+                (
+                    "didReceive GiveIdentifier: identifier!",
+                    ['                        client.json(["identifier": Keychain.shared.identifier!])'],
+                    [
+                        '                        guard let identifier = Keychain.shared.identifier else {',
+                        '                            self.printOut("No device identifier is available")',
+                        '                            client.disconnect(closeCode: 0)',
+                        '                            self.finish(.failure(OperationError.provisioningError(result: "No device identifier is available", message: nil)))',
+                        '                            return',
+                        '                        }',
+                        '                        client.json(["identifier": identifier])',
+                    ],
+                ),
+                (
+                    "didReceive GiveStartProvisioningData: startProvisioningURL!",
+                    ['                        var request = self.buildAppleRequest(url: self.startProvisioningURL!)'],
+                    [
+                        '                        guard let startProvisioningURL = self.startProvisioningURL else {',
+                        '                            self.printOut("Missing the start provisioning URL")',
+                        '                            client.disconnect(closeCode: 0)',
+                        '                            self.finish(.failure(OperationError.provisioningError(result: "Missing the start provisioning URL", message: nil)))',
+                        '                            return',
+                        '                        }',
+                        '                        var request = self.buildAppleRequest(url: startProvisioningURL)',
+                    ],
+                ),
+                (
+                    "didReceive GiveStartProvisioningData: nested plist downcast",
+                    [
+                        '                            if let data = data,',
+                        '                               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? Dictionary<String, Dictionary<String, Any>>,',
+                        '                               let spim = plist["Response"]?["spim"] as? String {',
+                    ],
+                    [
+                        '                            if let data = data,',
+                        '                               let rawPlist = try? PropertyListSerialization.propertyList(from: data, format: nil),',
+                        '                               let plist = rawPlist as? Dictionary<String, Any>,',
+                        '                               let responseDict = plist["Response"] as? Dictionary<String, Any>,',
+                        '                               let spim = responseDict["spim"] as? String {',
+                    ],
+                ),
+                (
+                    "didReceive GiveEndProvisioningData: endProvisioningURL!",
+                    ['                        var request = self.buildAppleRequest(url: self.endProvisioningURL!)'],
+                    [
+                        '                        guard let endProvisioningURL = self.endProvisioningURL else {',
+                        '                            self.printOut("Missing the end provisioning URL")',
+                        '                            client.disconnect(closeCode: 0)',
+                        '                            self.finish(.failure(OperationError.provisioningError(result: "Missing the end provisioning URL", message: nil)))',
+                        '                            return',
+                        '                        }',
+                        '                        var request = self.buildAppleRequest(url: endProvisioningURL)',
+                    ],
+                ),
+                (
+                    "didReceive GiveEndProvisioningData: nested plist downcast",
+                    [
+                        '                               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? Dictionary<String, Dictionary<String, Any>>,',
+                        '                               let ptm = plist["Response"]?["ptm"] as? String,',
+                        '                               let tk = plist["Response"]?["tk"] as? String {',
+                    ],
+                    [
+                        '                               let rawPlist = try? PropertyListSerialization.propertyList(from: data, format: nil),',
+                        '                               let plist = rawPlist as? Dictionary<String, Any>,',
+                        '                               let responseDict = plist["Response"] as? Dictionary<String, Any>,',
+                        '                               let ptm = responseDict["ptm"] as? String,',
+                        '                               let tk = responseDict["tk"] as? String {',
+                    ],
+                ),
+                (
+                    "didReceive ProvisioningSuccess: identifier! / adiPb!",
+                    ['                        self.fetchAnisetteV3(Keychain.shared.identifier!, Keychain.shared.adiPb!)'],
+                    [
+                        '                        guard let identifier = Keychain.shared.identifier else {',
+                        '                            self.printOut("No device identifier is available")',
+                        '                            self.finish(.failure(OperationError.provisioningError(result: "No device identifier is available", message: nil)))',
+                        '                            return',
+                        '                        }',
+                        '                        self.fetchAnisetteV3(identifier, adiPb)',
+                    ],
+                ),
+                (
+                    "buildAppleRequest: client info / user agent headers",
+                    [
+                        '        request.setValue(self.clientInfo!, forHTTPHeaderField: "X-Mme-Client-Info")',
+                        '        request.setValue(self.userAgent!, forHTTPHeaderField: "User-Agent")',
+                    ],
+                    [
+                        '        request.setValue(self.clientInfo ?? Self.appleClientInfo, forHTTPHeaderField: "X-Mme-Client-Info")',
+                        '        request.setValue(self.userAgent ?? Self.appleUserAgent, forHTTPHeaderField: "User-Agent")',
+                    ],
+                ),
+                (
+                    "buildAppleRequest: mdLu / deviceId headers",
+                    [
+                        '        request.setValue(self.mdLu!, forHTTPHeaderField: "X-Apple-I-MD-LU")',
+                        '        request.setValue(self.deviceId!, forHTTPHeaderField: "X-Mme-Device-Id")',
+                    ],
+                    [
+                        '        request.setValue(self.mdLu ?? "", forHTTPHeaderField: "X-Apple-I-MD-LU")',
+                        '        request.setValue(self.deviceId ?? "", forHTTPHeaderField: "X-Mme-Device-Id")',
+                    ],
+                ),
+                (
+                    "fetchClientInfo: url!",
+                    ['        let clientInfoURL = self.url!.appendingPathComponent("v3").appendingPathComponent("client_info")'],
+                    [
+                        '        guard let baseURL = self.url else {',
+                        '            return self.finish(.failure(OperationError.anisetteV3Error(message: "No anisette server URL is available")))',
+                        '        }',
+                        '        let clientInfoURL = baseURL.appendingPathComponent("v3").appendingPathComponent("client_info")',
+                    ],
+                ),
+                (
+                    "fetchClientInfo: [String: String] downcast",
+                    [
+                        '                if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: String] {',
+                        '                    if let clientInfo = json["client_info"] {',
+                    ],
+                    [
+                        '                if let rawJSON = try? JSONSerialization.jsonObject(with: data, options: []),',
+                        '                   let anyJSON = rawJSON as? [String: Any] {',
+                        '                    var json: [String: String] = [:]',
+                        '                    for (jsonKey, jsonValue) in anyJSON {',
+                        '                        if let jsonString = Self.stringValue(jsonValue) { json[jsonKey] = jsonString }',
+                        '                    }',
+                        '                    if let clientInfo = json["client_info"] {',
+                    ],
+                ),
+                (
+                    "fetchClientInfo: identifier / uuid derivation",
+                    [
+                        '                        if Keychain.shared.identifier == nil {',
+                        '                            self.printOut("Generating identifier")',
+                        '                            var bytes = [Int8](repeating: 0, count: 16)',
+                        '                            let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)',
+                        '                            ',
+                        '                            if status != errSecSuccess {',
+                        '                                self.printOut("ERROR GENERATING IDENTIFIER!!! \\(status)")',
+                        '                                return self.finish(.failure(OperationError.provisioningError(result: "Couldn\'t generate identifier", message: nil)))',
+                        '                            }',
+                        '                            ',
+                        '                            Keychain.shared.identifier = Data(bytes: &bytes, count: bytes.count).base64EncodedString()',
+                        '                        }',
+                        '                        ',
+                        '                        let decoded = Data(base64Encoded: Keychain.shared.identifier!)!',
+                        '                        self.mdLu = decoded.sha256().hexEncodedString()',
+                        '                        self.printOut("X-Apple-I-MD-LU: \\(self.mdLu!)")',
+                        '                        let uuid: UUID = decoded.object()',
+                        '                        self.deviceId = uuid.uuidString.uppercased()',
+                        '                        self.printOut("X-Mme-Device-Id: \\(self.deviceId!)")',
+                    ],
+                    [
+                        '                        guard self.deriveDeviceIdentifiers() else {',
+                        '                            self.finish(.failure(OperationError.provisioningError(result: "Couldn\'t derive the device identifiers", message: nil)))',
+                        '                            return',
+                        '                        }',
+                    ],
+                ),
+                (
+                    "fetchAnisetteV3: url!",
+                    ['            var request = URLRequest(url: self.url!.appendingPathComponent("v3").appendingPathComponent("get_headers"))'],
+                    [
+                        '            guard let baseURL = self.url else {',
+                        '                return self.finish(.failure(OperationError.anisetteV3Error(message: "No anisette server URL is available")))',
+                        '            }',
+                        '            var request = URLRequest(url: baseURL.appendingPathComponent("v3").appendingPathComponent("get_headers"))',
+                    ],
+                ),
+            ]
+
+            # Applied only when the client info is overridden with the official values.
+            CLIENT_INFO_SWAP = (
+                "fetchClientInfo: pin the official client info / user agent",
+                [
+                    '                        self.clientInfo = clientInfo',
+                    '                        self.userAgent = json["user_agent"]!',
+                    '                        self.printOut("Client-Info: \\(self.clientInfo!)")',
+                    '                        self.printOut("User-Agent: \\(self.userAgent!)")',
+                ],
+                [
+                    '                        self.printOut("Server-reported Client-Info: \\(clientInfo)")',
+                    '                        self.clientInfo = Self.appleClientInfo',
+                    '                        self.userAgent = json["user_agent"] ?? Self.appleUserAgent',
+                    '                        self.printOut("Client-Info: \\(self.clientInfo ?? "none")")',
+                    '                        self.printOut("User-Agent: \\(self.userAgent ?? "none")")',
+                ],
+            )
+
+            CLIENT_INFO_FALLBACK = (
+                "fetchClientInfo: keep server values but never force unwrap",
+                [
+                    '                        self.clientInfo = clientInfo',
+                    '                        self.userAgent = json["user_agent"]!',
+                    '                        self.printOut("Client-Info: \\(self.clientInfo!)")',
+                    '                        self.printOut("User-Agent: \\(self.userAgent!)")',
+                ],
+                [
+                    '                        self.printOut("Server-reported Client-Info: \\(clientInfo)")',
+                    '                        self.clientInfo = clientInfo',
+                    '                        self.userAgent = json["user_agent"] ?? Self.appleUserAgent',
+                    '                        self.printOut("Client-Info: \\(self.clientInfo ?? "none")")',
+                    '                        self.printOut("User-Agent: \\(self.userAgent ?? "none")")',
+                ],
+            )
 
 
-          def sanitize(src, label, pattern, repl, already):
-              if already in src:
-                  print("= %s assignment already sanitized" % label)
-                  return src
-              new_src, count = re.subn(pattern, repl, src, flags=re.MULTILINE)
-              if count == 0:
-                  print("ERROR: cannot find the %s assignment" % label)
-                  return None
-              print("+ sanitized the %s assignment" % label)
-              return new_src
+            def find_block(lines, old_lines):
+                """Locate old_lines in lines, ignoring trailing whitespace. Returns (index, unique)."""
+                n = len(old_lines)
+                hits = []
+                for i in range(0, len(lines) - n + 1):
+                    if all(lines[i + j].rstrip() == old_lines[j].rstrip() for j in range(n)):
+                        hits.append(i)
+                return hits
 
 
-          def main():
-              mode = os.environ.get("PATCH_MODE", "full").strip().lower()
-              if mode not in ("full", "strings", "none"):
-                  print("ERROR: unknown PATCH_MODE: %r" % mode)
-                  return 1
-
-              if mode == "none":
-                  print("= control build requested: source left untouched")
-                  return 0
-
-              if not TARGET.is_file():
-                  print("ERROR: %s not found (run me from the repo root)" % TARGET)
-                  return 1
-
-              src = TARGET.read_text(encoding="utf-8")
-              original = src
-
-              # 1. helper methods, inserted right before the COMMON section
-              if "sanitizedAppleString" in src:
-                  print("= helper methods already present")
-              else:
-                  anchor = "    // MARK: - COMMON"
-                  if anchor not in src:
-                      print("ERROR: missing the '// MARK: - COMMON' anchor")
-                      return 1
-                  src = src.replace(anchor, HELPERS + anchor, 1)
-                  print("+ inserted sanitizedAppleString() / migrateAnisetteClientIfNeeded()")
-
-              # 2. run the migration at the start of main()
-              if mode != "full":
-                  print("= PATCH_MODE=%s: skipping the adi.pb migration" % mode)
-              elif "Self.migrateAnisetteClientIfNeeded()" in src:
-                  print("= migration call already present")
-              else:
-                  anchor = "        super.main()\n"
-                  if anchor not in src:
-                      print("ERROR: missing 'super.main()'")
-                      return 1
-                  injected = (
-                      anchor
-                      + "        \n"
-                      + "        // Apple 503 fix: drop the adi.pb that was provisioned with the\n"
-                      + "        // (now rejected) Xcode marker, so we re-provision with the akd one.\n"
-                      + "        Self.migrateAnisetteClientIfNeeded()\n"
-                  )
-                  src = src.replace(anchor, injected, 1)
-                  print("+ hooked migrateAnisetteClientIfNeeded() into main()")
-
-              # 3. sanitize whatever client_info / user_agent the server reports
-              for label, pattern, repl, already in ASSIGNMENTS:
-                  src = sanitize(src, label, pattern, repl, already)
-                  if src is None:
-                      return 1
-
-              if src == original:
-                  print("nothing to do, tree already patched")
-                  return 0
-
-              TARGET.write_text(src, encoding="utf-8")
-              print("patched %s" % TARGET)
-              return 0
+            def apply(lines, label, old_lines, new_lines):
+                hits = find_block(lines, old_lines)
+                if not hits:
+                    print("ERROR: block not found -> %s" % label)
+                    print("       first line: %r" % old_lines[0])
+                    return None
+                if len(hits) > 1:
+                    print("ERROR: block is ambiguous (%d matches) -> %s" % (len(hits), label))
+                    return None
+                i = hits[0]
+                out = lines[:i] + list(new_lines) + lines[i + len(old_lines):]
+                print("+ %s" % label)
+                return out
 
 
-          sys.exit(main())
+            def main():
+                mode = os.environ.get("PATCH_MODE", "official").strip().lower()
+                if mode not in ("official", "server", "none"):
+                    print("ERROR: unknown PATCH_MODE: %r" % mode)
+                    return 1
+
+                if mode == "none":
+                    print("= control build requested: source left untouched")
+                    return 0
+
+                if not TARGET.is_file():
+                    print("ERROR: %s not found (run me from the repo root)" % TARGET)
+                    return 1
+
+                lines = TARGET.read_text(encoding="utf-8").split("\n")
+                original = list(lines)
+
+                if "appleClientInfo" in "\n".join(lines):
+                    print("= helpers already present")
+                else:
+                    anchor = "    // MARK: - COMMON"
+                    idx = [i for i, l in enumerate(lines) if l.rstrip() == anchor]
+                    if not idx:
+                        print("ERROR: missing the '// MARK: - COMMON' anchor")
+                        return 1
+                    i = idx[0]
+                    lines = lines[:i] + CLIENT_INFO.rstrip("\n").split("\n") + [""] + lines[i:]
+                    print("+ inserted the official client info + hardening helpers")
+
+                swap = CLIENT_INFO_SWAP if mode == "official" else CLIENT_INFO_FALLBACK
+                for label, old_lines, new_lines in SAFETY + [swap]:
+                    lines = apply(lines, label, old_lines, new_lines)
+                    if lines is None:
+                        return 1
+
+                if mode in ("official", "server"):
+                    anchor = "        super.main()\n"
+                    idx = [i for i, l in enumerate(lines) if l.rstrip() == "        super.main()"]
+                    if not idx:
+                        print("ERROR: missing 'super.main()'")
+                        return 1
+                    i = idx[0]
+                    injected = [
+                        '        super.main()',
+                        '',
+                        '        // Apple sign-in fix: drop the adi.pb that was provisioned with an',
+                        '        // outdated client info, so we provision again with the current one.',
+                        '        Self.resetAnisetteIdentityOnce()',
+                    ]
+                    lines = lines[:i] + injected + lines[i + 1:]
+                    print("+ hooked resetAnisetteIdentityOnce() into main()")
+
+                if lines == original:
+                    print("nothing to do, tree already patched")
+                    return 0
+
+                TARGET.write_text("\n".join(lines), encoding="utf-8")
+                print("patched %s" % TARGET)
+                return 0
+
+
+            sys.exit(main())
           PYEOF
           python3 "$RUNNER_TEMP/fix063.py"
 
@@ -357,8 +724,8 @@ jobs:
             gh release upload "$VARIANT_TAG" "$IPA_NAME" --clobber
           else
             gh release create "$VARIANT_TAG" \
-              --target 0.6.3 \
+              --target main \
               --title "SideStore 0.6.3 (patch mode: $PATCH_MODE)" \
-              --notes "构建变体 patch_mode=$PATCH_MODE。full = 字符串改写 + 清除旧 adi.pb；strings = 仅字符串改写；none = 未改动的 0.6.3 对照包。" \
+              --notes "构建变体 patch_mode=$PATCH_MODE。official = 官方 client info/UA（macOS 26.6 / Xcode 26.0）+ 抗崩改造 + 清除旧 adi.pb；server = 仅抗崩改造、沿用服务器下发值；none = 未改动的 0.6.3 对照包。" \
               "$IPA_NAME"
           fi
